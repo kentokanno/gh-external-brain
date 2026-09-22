@@ -74,7 +74,12 @@ paths:
       operationId: getExternalMemory
       summary: Get one memory
       parameters:
-        - $ref: "#/components/parameters/MemoryId"
+        - name: memory_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
       responses:
         "200":
           description: Memory
@@ -82,7 +87,12 @@ paths:
       operationId: updateExternalMemory
       summary: Update one memory
       parameters:
-        - $ref: "#/components/parameters/MemoryId"
+        - name: memory_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
       requestBody:
         required: true
         content:
@@ -96,7 +106,12 @@ paths:
       operationId: deleteExternalMemory
       summary: Delete one memory
       parameters:
-        - $ref: "#/components/parameters/MemoryId"
+        - name: memory_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
       responses:
         "200":
           description: Deletion confirmation
@@ -138,7 +153,12 @@ paths:
       operationId: getExternalTask
       summary: Get one external task
       parameters:
-        - $ref: "#/components/parameters/TaskId"
+        - name: task_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
       responses:
         "200":
           description: Task
@@ -146,7 +166,12 @@ paths:
       operationId: updateExternalTask
       summary: Update task status or result
       parameters:
-        - $ref: "#/components/parameters/TaskId"
+        - name: task_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
       requestBody:
         required: true
         content:
@@ -157,21 +182,6 @@ paths:
         "200":
           description: Updated task
 components:
-  parameters:
-    MemoryId:
-      name: memory_id
-      in: path
-      required: true
-      schema:
-        type: string
-        format: uuid
-    TaskId:
-      name: task_id
-      in: path
-      required: true
-      schema:
-        type: string
-        format: uuid
   schemas:
     MemoryCreate:
       type: object
