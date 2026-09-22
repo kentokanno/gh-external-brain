@@ -1,0 +1,265 @@
+openapi: 3.1.0
+info:
+  title: GH External Brain
+  description: Persistent memory and external task workspace for GH.
+  version: 0.4.0
+servers:
+  - url: https://gh-external-brain.onrender.com
+paths:
+  /health:
+    get:
+      operationId: checkExternalBrainHealth
+      summary: Check External Brain health
+      responses:
+        "200":
+          description: Health status
+  /capabilities:
+    get:
+      operationId: getExternalBrainCapabilities
+      summary: List External Brain capabilities
+      responses:
+        "200":
+          description: Capability list
+  /memories:
+    get:
+      operationId: listExternalMemories
+      summary: List stored memories
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+      responses:
+        "200":
+          description: Memory list
+    post:
+      operationId: createExternalMemory
+      summary: Store a persistent memory
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MemoryCreate"
+      responses:
+        "201":
+          description: Memory created
+  /memories/search:
+    get:
+      operationId: searchExternalMemories
+      summary: Search stored memories
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 50
+            default: 10
+      responses:
+        "200":
+          description: Search results
+  /memories/{memory_id}:
+    get:
+      operationId: getExternalMemory
+      summary: Get one memory
+      parameters:
+        - $ref: "#/components/parameters/MemoryId"
+      responses:
+        "200":
+          description: Memory
+    patch:
+      operationId: updateExternalMemory
+      summary: Update one memory
+      parameters:
+        - $ref: "#/components/parameters/MemoryId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MemoryUpdate"
+      responses:
+        "200":
+          description: Updated memory
+    delete:
+      operationId: deleteExternalMemory
+      summary: Delete one memory
+      parameters:
+        - $ref: "#/components/parameters/MemoryId"
+      responses:
+        "200":
+          description: Deletion confirmation
+  /tasks:
+    get:
+      operationId: listExternalTasks
+      summary: List external tasks
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema:
+            $ref: "#/components/schemas/TaskStatus"
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+      responses:
+        "200":
+          description: Task list
+    post:
+      operationId: createExternalTask
+      summary: Add work to the external task queue
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TaskCreate"
+      responses:
+        "201":
+          description: Task created
+  /tasks/{task_id}:
+    get:
+      operationId: getExternalTask
+      summary: Get one external task
+      parameters:
+        - $ref: "#/components/parameters/TaskId"
+      responses:
+        "200":
+          description: Task
+    patch:
+      operationId: updateExternalTask
+      summary: Update task status or result
+      parameters:
+        - $ref: "#/components/parameters/TaskId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TaskUpdate"
+      responses:
+        "200":
+          description: Updated task
+components:
+  parameters:
+    MemoryId:
+      name: memory_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    TaskId:
+      name: task_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+  schemas:
+    MemoryCreate:
+      type: object
+      required:
+        - content
+      properties:
+        title:
+          type:
+            - string
+            - "null"
+        content:
+          type: string
+        tags:
+          type: array
+          items:
+            type: string
+          default: []
+        importance:
+          type: integer
+          minimum: 1
+          maximum: 10
+          default: 5
+    MemoryUpdate:
+      type: object
+      properties:
+        title:
+          type:
+            - string
+            - "null"
+        content:
+          type: string
+        tags:
+          type: array
+          items:
+            type: string
+        importance:
+          type: integer
+          minimum: 1
+          maximum: 10
+    TaskStatus:
+      type: string
+      enum:
+        - queued
+        - running
+        - completed
+        - failed
+        - cancelled
+    TaskCreate:
+      type: object
+      required:
+        - instruction
+      properties:
+        title:
+          type:
+            - string
+            - "null"
+        instruction:
+          type: string
+        priority:
+          type: integer
+          minimum: 1
+          maximum: 10
+          default: 5
+        requires_approval:
+          type: boolean
+          default: true
+    TaskUpdate:
+      type: object
+      properties:
+        status:
+          $ref: "#/components/schemas/TaskStatus"
+        title:
+          type:
+            - string
+            - "null"
+        instruction:
+          type: string
+        priority:
+          type: integer
+          minimum: 1
+          maximum: 10
+        requires_approval:
+          type: boolean
+        result:
+          type:
+            - string
+            - "null"
+        error:
+          type:
+            - string
+            - "null"
