@@ -1,0 +1,56 @@
+name: External Brain Connection Test
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/external-brain-test.yml'
+  workflow_dispatch:
+
+jobs:
+  test-external-brain:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Save memory
+        id: save
+        shell: bash
+        run: |
+          set -euo pipefail
+          RESPONSE=$(curl -sS -f -X POST 'https://gh-external-brain.onrender.com/memories' \
+            -H 'Content-Type: application/json' \
+            --data '{"title":"GH_EXTERNAL_BRAIN_TEST_20260922","content":"GH_EXTERNAL_BRAIN_TEST_20260922 = 外部脳接続成功","tags":["connection-test","20260922"],"importance":10}')
+          echo "$RESPONSE" | tee save-response.json
+          MEMORY_ID=$(echo "$RESPONSE" | python -c 'import sys,json; print(json.load(sys.stdin)["id"])')
+          echo "memory_id=$MEMORY_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Search memory
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -sS -f --get 'https://gh-external-brain.onrender.com/memories/search' \
+            --data-urlencode 'q=GH_EXTERNAL_BRAIN_TEST_20260922' \
+            | tee search-response.json
+          python - <<'PY'
+          import json
+          with open('search-response.json', encoding='utf-8') as f:
+              data = json.load(f)
+          expected = 'GH_EXTERNAL_BRAIN_TEST_20260922 = 外部脳接続成功'
+          assert any(m.get('content') == expected for m in data.get('memories', [])), data
+          print('SEARCH_OK:', expected)
+          PY
+
+      - name: Read memory by ID
+        shell: bash
+        env:
+          MEMORY_ID: ${{ steps.save.outputs.memory_id }}
+        run: |
+          set -euo pipefail
+          curl -sS -f "https://gh-external-brain.onrender.com/memories/$MEMORY_ID" | tee read-response.json
+          python - <<'PY'
+          import json
+          with open('read-response.json', encoding='utf-8') as f:
+              data = json.load(f)
+          expected = 'GH_EXTERNAL_BRAIN_TEST_20260922 = 外部脳接続成功'
+          assert data.get('content') == expected, data
+          print('READ_OK:', expected)
+          PY
