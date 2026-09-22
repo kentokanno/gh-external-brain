@@ -1,3 +1,4 @@
+import hmac
 import os
 from datetime import datetime, timezone
 from typing import Optional
@@ -5,15 +6,16 @@ from uuid import UUID, uuid4
 
 import psycopg
 from psycopg.rows import dict_row
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
+EXTERNAL_BRAIN_API_KEY = os.environ.get("EXTERNAL_BRAIN_API_KEY")
 
 app = FastAPI(
     title="GH External Brain",
-    version="0.2.0",
+    version="0.3.0",
     description="Persistent external memory workspace for GH."
 )
 
@@ -32,6 +34,27 @@ class MemoryUpdate(BaseModel):
     title: Optional[str] = Field(default=None, max_length=500)
     tags: Optional[list[str]] = None
     importance: Optional[int] = Field(default=None, ge=1, le=10)
+
+
+# ---------- Authentication ----------
+
+def require_api_key(
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+):
+    if not EXTERNAL_BRAIN_API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="EXTERNAL_BRAIN_API_KEY is not configured",
+        )
+
+    if x_api_key is None or not hmac.compare_digest(
+        x_api_key,
+        EXTERNAL_BRAIN_API_KEY,
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or missing API key",
+        )
 
 
 # ---------- Database ----------
@@ -86,7 +109,7 @@ def startup():
 def root():
     return {
         "system": "GH External Brain",
-        "version": "0.2.0",
+        "version": "0.3.0",
         "status": "online"
     }
 
@@ -148,7 +171,7 @@ def capabilities():
 
 # ---------- Memory ----------
 
-@app.post("/memories", status_code=201)
+@app.post("/memories", status_code=201, dependencies=[Depends(require_api_key)])
 def create_memory(memory: MemoryCreate):
     memory_id = uuid4()
     now = datetime.now(timezone.utc)
@@ -181,7 +204,7 @@ def create_memory(memory: MemoryCreate):
     return result
 
 
-@app.get("/memories/search")
+@app.get("/memories/search", dependencies=[Depends(require_api_key)])
 def search_memories(
     q: str = Query(min_length=1, max_length=500),
     limit: int = Query(default=10, ge=1, le=50),
@@ -217,7 +240,7 @@ def search_memories(
     }
 
 
-@app.get("/memories")
+@app.get("/memories", dependencies=[Depends(require_api_key)])
 def list_memories(
     limit: int = Query(default=20, ge=1, le=100),
 ):
@@ -241,7 +264,7 @@ def list_memories(
     }
 
 
-@app.get("/memories/{memory_id}")
+@app.get("/memories/{memory_id}", dependencies=[Depends(require_api_key)])
 def get_memory(memory_id: UUID):
     with get_connection() as conn:
         with conn.cursor() as cur:
@@ -258,7 +281,7 @@ def get_memory(memory_id: UUID):
     return result
 
 
-@app.patch("/memories/{memory_id}")
+@app.patch("/memories/{memory_id}", dependencies=[Depends(require_api_key)])
 def update_memory(memory_id: UUID, memory: MemoryUpdate):
     changes = memory.model_dump(exclude_unset=True)
 
@@ -303,7 +326,7 @@ def update_memory(memory_id: UUID, memory: MemoryUpdate):
     return result
 
 
-@app.delete("/memories/{memory_id}")
+@app.delete("/memories/{memory_id}", dependencies=[Depends(require_api_key)])
 def delete_memory(memory_id: UUID):
     with get_connection() as conn:
         with conn.cursor() as cur:
