@@ -15,7 +15,7 @@ EXTERNAL_BRAIN_API_KEY = os.environ.get("EXTERNAL_BRAIN_API_KEY")
 
 app = FastAPI(
     title="GH External Brain",
-    version="0.3.0",
+    version="0.3.1",
     description="Persistent external memory workspace for GH."
 )
 
@@ -48,8 +48,8 @@ def require_api_key(
         )
 
     if x_api_key is None or not hmac.compare_digest(
-        x_api_key,
-        EXTERNAL_BRAIN_API_KEY,
+        x_api_key.encode("utf-8"),
+        EXTERNAL_BRAIN_API_KEY.encode("utf-8"),
     ):
         raise HTTPException(
             status_code=401,
@@ -109,7 +109,7 @@ def startup():
 def root():
     return {
         "system": "GH External Brain",
-        "version": "0.3.0",
+        "version": "0.3.1",
         "status": "online"
     }
 
