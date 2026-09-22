@@ -1,7 +1,7 @@
 import hmac
 import os
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Literal, Optional
 from uuid import UUID, uuid4
 
 import psycopg
@@ -15,7 +15,7 @@ EXTERNAL_BRAIN_API_KEY = os.environ.get("EXTERNAL_BRAIN_API_KEY")
 
 app = FastAPI(
     title="GH External Brain",
-    version="0.3.1",
+    version="0.4.0",
     description="Persistent external memory workspace for GH."
 )
 
@@ -34,6 +34,25 @@ class MemoryUpdate(BaseModel):
     title: Optional[str] = Field(default=None, max_length=500)
     tags: Optional[list[str]] = None
     importance: Optional[int] = Field(default=None, ge=1, le=10)
+
+
+class TaskCreate(BaseModel):
+    instruction: str = Field(min_length=1, max_length=50000)
+    title: Optional[str] = Field(default=None, max_length=500)
+    priority: int = Field(default=5, ge=1, le=10)
+    requires_approval: bool = True
+
+
+class TaskUpdate(BaseModel):
+    status: Optional[
+        Literal["queued", "running", "completed", "failed", "cancelled"]
+    ] = None
+    title: Optional[str] = Field(default=None, max_length=500)
+    instruction: Optional[str] = Field(default=None, min_length=1, max_length=50000)
+    priority: Optional[int] = Field(default=None, ge=1, le=10)
+    requires_approval: Optional[bool] = None
+    result: Optional[str] = Field(default=None, max_length=50000)
+    error: Optional[str] = Field(default=None, max_length=10000)
 
 
 # ---------- Authentication ----------
@@ -90,6 +109,42 @@ def initialize_database():
 
             cur.execute(
                 """
+                CREATE TABLE IF NOT EXISTS tasks (
+                    id UUID PRIMARY KEY,
+                    title TEXT,
+                    instruction TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'queued'
+                        CHECK (
+                            status IN (
+                                'queued',
+                                'running',
+                                'completed',
+                                'failed',
+                                'cancelled'
+                            )
+                        ),
+                    priority INTEGER NOT NULL DEFAULT 5
+                        CHECK (priority BETWEEN 1 AND 10),
+                    requires_approval BOOLEAN NOT NULL DEFAULT TRUE,
+                    result TEXT,
+                    error TEXT,
+                    created_at TIMESTAMPTZ NOT NULL,
+                    updated_at TIMESTAMPTZ NOT NULL,
+                    started_at TIMESTAMPTZ,
+                    completed_at TIMESTAMPTZ
+                )
+                """
+            )
+
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_tasks_queue
+                ON tasks (status, priority DESC, created_at ASC)
+                """
+            )
+
+            cur.execute(
+                """
                 CREATE INDEX IF NOT EXISTS idx_memories_created_at
                 ON memories (created_at DESC)
                 """
@@ -109,7 +164,7 @@ def startup():
 def root():
     return {
         "system": "GH External Brain",
-        "version": "0.3.1",
+        "version": "0.4.0",
         "status": "online"
     }
 
@@ -164,6 +219,21 @@ def capabilities():
                 "id": "memory.delete",
                 "effect": "DESTRUCTIVE",
                 "description": "Delete stored information"
+            },
+            {
+                "id": "task.create",
+                "effect": "REVERSIBLE",
+                "description": "Add work to the external task queue"
+            },
+            {
+                "id": "task.read",
+                "effect": "READ_ONLY",
+                "description": "Read queued work and results"
+            },
+            {
+                "id": "task.update",
+                "effect": "REVERSIBLE",
+                "description": "Update task status and results"
             }
         ]
     }
@@ -350,3 +420,161 @@ def delete_memory(memory_id: UUID):
         "deleted": True,
         "id": result["id"]
     }
+
+
+# ---------- Tasks ----------
+
+@app.post("/tasks", status_code=201, dependencies=[Depends(require_api_key)])
+def create_task(task: TaskCreate):
+    task_id = uuid4()
+    now = datetime.now(timezone.utc)
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO tasks (
+                    id,
+                    title,
+                    instruction,
+                    status,
+                    priority,
+                    requires_approval,
+                    created_at,
+                    updated_at
+                )
+                VALUES (%s, %s, %s, 'queued', %s, %s, %s, %s)
+                RETURNING *
+                """,
+                (
+                    task_id,
+                    task.title,
+                    task.instruction,
+                    task.priority,
+                    task.requires_approval,
+                    now,
+                    now,
+                ),
+            )
+            result = cur.fetchone()
+
+        conn.commit()
+
+    return result
+
+
+@app.get("/tasks", dependencies=[Depends(require_api_key)])
+def list_tasks(
+    status: Optional[
+        Literal["queued", "running", "completed", "failed", "cancelled"]
+    ] = Query(default=None),
+    limit: int = Query(default=20, ge=1, le=100),
+):
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            if status is None:
+                cur.execute(
+                    """
+                    SELECT *
+                    FROM tasks
+                    ORDER BY priority DESC, created_at ASC
+                    LIMIT %s
+                    """,
+                    (limit,),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT *
+                    FROM tasks
+                    WHERE status = %s
+                    ORDER BY priority DESC, created_at ASC
+                    LIMIT %s
+                    """,
+                    (status, limit),
+                )
+
+            results = cur.fetchall()
+
+    return {
+        "count": len(results),
+        "tasks": results,
+    }
+
+
+@app.get("/tasks/{task_id}", dependencies=[Depends(require_api_key)])
+def get_task(task_id: UUID):
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM tasks WHERE id = %s",
+                (task_id,),
+            )
+            result = cur.fetchone()
+
+    if result is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    return result
+
+
+@app.patch("/tasks/{task_id}", dependencies=[Depends(require_api_key)])
+def update_task(task_id: UUID, task: TaskUpdate):
+    changes = task.model_dump(exclude_unset=True)
+
+    if not changes:
+        raise HTTPException(status_code=400, detail="No changes supplied")
+
+    allowed = {
+        "status",
+        "title",
+        "instruction",
+        "priority",
+        "requires_approval",
+        "result",
+        "error",
+    }
+    assignments = []
+    values = []
+
+    for field, value in changes.items():
+        if field not in allowed:
+            continue
+
+        assignments.append(f"{field} = %s")
+        values.append(value)
+
+    now = datetime.now(timezone.utc)
+
+    if changes.get("status") == "running":
+        assignments.append("started_at = COALESCE(started_at, %s)")
+        values.append(now)
+
+    if changes.get("status") in {"completed", "failed", "cancelled"}:
+        assignments.append("completed_at = %s")
+        values.append(now)
+
+    assignments.append("updated_at = %s")
+    values.append(now)
+    values.append(task_id)
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                UPDATE tasks
+                SET {", ".join(assignments)}
+                WHERE id = %s
+                RETURNING *
+                """,
+                values,
+            )
+            result = cur.fetchone()
+
+        conn.commit()
+
+    if result is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    return result
+
