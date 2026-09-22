@@ -7,15 +7,19 @@ from uuid import UUID, uuid4
 import psycopg
 from psycopg.rows import dict_row
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from openai import OpenAI
 from pydantic import BaseModel, Field
 
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 EXTERNAL_BRAIN_API_KEY = os.environ.get("EXTERNAL_BRAIN_API_KEY")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-6-astra")
+OPENAI_MAX_OUTPUT_TOKENS = int(os.environ.get("OPENAI_MAX_OUTPUT_TOKENS", "3000"))
 
 app = FastAPI(
     title="GH External Brain",
-    version="0.4.0",
+    version="0.5.0",
     description="Persistent external memory workspace for GH."
 )
 
@@ -137,6 +141,16 @@ def initialize_database():
             )
 
             cur.execute(
+                "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS openai_response_id TEXT"
+            )
+            cur.execute(
+                "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS model TEXT"
+            )
+            cur.execute(
+                "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS approved_at TIMESTAMPTZ"
+            )
+
+            cur.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_tasks_queue
                 ON tasks (status, priority DESC, created_at ASC)
@@ -164,7 +178,7 @@ def startup():
 def root():
     return {
         "system": "GH External Brain",
-        "version": "0.4.0",
+        "version": "0.5.0",
         "status": "online"
     }
 
@@ -187,6 +201,7 @@ def health():
     return {
         "status": "healthy" if db_status == "connected" else "degraded",
         "database": db_status,
+        "openai": "configured" if OPENAI_API_KEY else "not_configured",
         "timestamp": datetime.now(timezone.utc).isoformat()
     }
 
@@ -234,6 +249,11 @@ def capabilities():
                 "id": "task.update",
                 "effect": "REVERSIBLE",
                 "description": "Update task status and results"
+            },
+            {
+                "id": "task.execute",
+                "effect": "CONSEQUENTIAL",
+                "description": "Approve and execute a queued task with OpenAI"
             }
         ]
     }
@@ -424,6 +444,184 @@ def delete_memory(memory_id: UUID):
 
 # ---------- Tasks ----------
 
+TERMINAL_TASK_STATUSES = {"completed", "failed", "cancelled"}
+
+
+def get_openai_client():
+    if not OPENAI_API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="OPENAI_API_KEY is not configured",
+        )
+
+    return OpenAI(api_key=OPENAI_API_KEY)
+
+
+def refresh_task_execution(task_id: UUID):
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM tasks WHERE id = %s", (task_id,))
+            task = cur.fetchone()
+
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    if (
+        task["status"] in TERMINAL_TASK_STATUSES
+        or not task.get("openai_response_id")
+    ):
+        return task
+
+    try:
+        response = get_openai_client().responses.retrieve(
+            task["openai_response_id"]
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Could not refresh OpenAI response: {exc}",
+        ) from exc
+
+    response_status = getattr(response.status, "value", response.status)
+    now = datetime.now(timezone.utc)
+    assignments = ["updated_at = %s"]
+    values = [now]
+
+    if response_status == "completed":
+        assignments.extend(
+            ["status = 'completed'", "result = %s", "error = NULL", "completed_at = %s"]
+        )
+        values.extend([response.output_text or "", now])
+    elif response_status in {"failed", "incomplete", "cancelled"}:
+        error = getattr(response, "error", None)
+        error_message = getattr(error, "message", None)
+        if not error_message:
+            incomplete = getattr(response, "incomplete_details", None)
+            error_message = str(incomplete or response_status)
+
+        final_status = "cancelled" if response_status == "cancelled" else "failed"
+        assignments.extend(
+            ["status = %s", "error = %s", "completed_at = %s"]
+        )
+        values.extend([final_status, error_message[:10000], now])
+    else:
+        assignments.append("status = 'running'")
+
+    values.append(task_id)
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                UPDATE tasks
+                SET {", ".join(assignments)}
+                WHERE id = %s
+                RETURNING *
+                """,
+                values,
+            )
+            task = cur.fetchone()
+        conn.commit()
+
+    return task
+
+
+def start_task_execution(task_id: UUID, approved: bool):
+    now = datetime.now(timezone.utc)
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM tasks WHERE id = %s FOR UPDATE",
+                (task_id,),
+            )
+            task = cur.fetchone()
+
+            if task is None:
+                raise HTTPException(status_code=404, detail="Task not found")
+
+            if task.get("openai_response_id"):
+                return task
+
+            if task["status"] != "queued":
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Task cannot be executed from status {task['status']}",
+                )
+
+            if task["requires_approval"] and not approved:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Task requires explicit approval before execution",
+                )
+
+            cur.execute(
+                """
+                UPDATE tasks
+                SET status = 'running',
+                    started_at = COALESCE(started_at, %s),
+                    approved_at = CASE WHEN %s THEN %s ELSE approved_at END,
+                    updated_at = %s,
+                    error = NULL
+                WHERE id = %s
+                RETURNING *
+                """,
+                (now, approved, now, now, task_id),
+            )
+            task = cur.fetchone()
+        conn.commit()
+
+    try:
+        response = get_openai_client().responses.create(
+            model=OPENAI_MODEL,
+            background=True,
+            max_output_tokens=OPENAI_MAX_OUTPUT_TOKENS,
+            instructions=(
+                "You are GH External Brain's safe task execution engine. "
+                "Complete research, analysis, planning, summarization, and drafting tasks. "
+                "Return a useful final deliverable, in Japanese unless the task requests another language. "
+                "Do not claim to have sent, purchased, deleted, published, or changed anything in an external service. "
+                "When an external side effect is requested, prepare the draft or action plan and clearly say that human approval is required."
+            ),
+            input=task["instruction"],
+            metadata={"external_brain_task_id": str(task_id)},
+        )
+    except Exception as exc:
+        failed_at = datetime.now(timezone.utc)
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE tasks
+                    SET status = 'failed', error = %s,
+                        updated_at = %s, completed_at = %s
+                    WHERE id = %s
+                    RETURNING *
+                    """,
+                    (str(exc)[:10000], failed_at, failed_at, task_id),
+                )
+                failed_task = cur.fetchone()
+            conn.commit()
+        return failed_task
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE tasks
+                SET openai_response_id = %s, model = %s, updated_at = %s
+                WHERE id = %s
+                RETURNING *
+                """,
+                (response.id, OPENAI_MODEL, datetime.now(timezone.utc), task_id),
+            )
+            task = cur.fetchone()
+        conn.commit()
+
+    return task
+
 @app.post("/tasks", status_code=201, dependencies=[Depends(require_api_key)])
 def create_task(task: TaskCreate):
     task_id = uuid4()
@@ -460,7 +658,18 @@ def create_task(task: TaskCreate):
 
         conn.commit()
 
+    if not task.requires_approval:
+        return start_task_execution(task_id, approved=False)
+
     return result
+
+
+@app.post(
+    "/tasks/{task_id}/execute",
+    dependencies=[Depends(require_api_key)],
+)
+def approve_and_execute_task(task_id: UUID):
+    return start_task_execution(task_id, approved=True)
 
 
 @app.get("/tasks", dependencies=[Depends(require_api_key)])
@@ -514,6 +723,9 @@ def get_task(task_id: UUID):
 
     if result is None:
         raise HTTPException(status_code=404, detail="Task not found")
+
+    if result["status"] == "running" and result.get("openai_response_id"):
+        return refresh_task_execution(task_id)
 
     return result
 
@@ -577,4 +789,3 @@ def update_task(task_id: UUID, task: TaskUpdate):
         raise HTTPException(status_code=404, detail="Task not found")
 
     return result
-

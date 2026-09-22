@@ -2,7 +2,7 @@ openapi: 3.1.0
 info:
   title: GH External Brain
   description: Persistent memory and external task workspace for GH.
-  version: 0.4.0
+  version: 0.5.0
 servers:
   - url: https://gh-external-brain.onrender.com
 paths:
@@ -181,6 +181,22 @@ paths:
       responses:
         "200":
           description: Updated task
+  /tasks/{task_id}/execute:
+    post:
+      operationId: approveAndExecuteExternalTask
+      summary: Explicitly approve and execute a queued external task
+      description: Starts an OpenAI background response. This is the explicit approval step for tasks created with requires_approval=true.
+      x-openai-isConsequential: true
+      parameters:
+        - name: task_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Task execution started
 components:
   schemas:
     MemoryCreate:
